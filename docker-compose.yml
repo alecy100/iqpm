@@ -1,0 +1,67 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: iqpm
+      POSTGRES_PASSWORD: iqpm
+      POSTGRES_DB: iqpm
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iqpm -d iqpm"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mlflow:
+    image: python:3.11-slim
+    working_dir: /mlflow
+    command: >
+      sh -c "pip install --no-cache-dir mlflow==2.19.0 psycopg2-binary==2.9.10 &&
+      mlflow server --host 0.0.0.0 --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts"
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    environment:
+      DATABASE_URL: postgresql+psycopg2://iqpm:iqpm@postgres:5432/iqpm
+      CSV_PATH: /data/synthetic_timeseries.csv
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      STREAM_INTERVAL_SECONDS: 1
+      LABEL_REVEAL_LAG_HOURS: 6
+      MODEL_DIR: /models
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./synthetic_timeseries.csv:/data/synthetic_timeseries.csv:ro
+      - model_data:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    environment:
+      VITE_API_BASE: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  mlflow_data:
+  model_data:
