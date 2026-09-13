@@ -8,6 +8,8 @@ from app.config import get_settings
 from app.models import ModelDeployment, PredictionLog, SensorReading
 from app.services.features import FEATURE_COLUMNS, reading_to_features
 
+import shap
+
 
 def machines(db: Session) -> list[str]:
     rows = db.query(SensorReading.machine_id).distinct().order_by(SensorReading.machine_id.asc()).all()
@@ -137,8 +139,6 @@ def _supervised_score(model_bundle: dict | None, x_frame: pd.DataFrame, reading:
 
 def _tree_explanation(model, x_frame: pd.DataFrame) -> dict | None:
     try:
-        import shap
-
         explainer = shap.TreeExplainer(model)
         values = explainer.shap_values(x_frame)
         row_values = values[-1][0] if isinstance(values, list) else values[0]

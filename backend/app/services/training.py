@@ -10,6 +10,11 @@ from app.config import get_settings
 from app.models import ExperimentRun, FailureLabel, ModelDeployment, SensorReading
 from app.services.features import FEATURE_COLUMNS
 
+from flaml import AutoML
+from sklearn.ensemble import IsolationForest
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
+import mlflow
 
 def train_models_for_machine(db: Session, machine_id: str) -> dict:
     settings = get_settings()
@@ -195,8 +200,6 @@ def _time_split(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
 def _fit_classifier(x_train: pd.DataFrame, y_train: pd.Series):
     try:
-        from flaml import AutoML
-
         model = AutoML()
         model.fit(
             X_train=x_train,
@@ -210,8 +213,6 @@ def _fit_classifier(x_train: pd.DataFrame, y_train: pd.Series):
         )
         return model
     except Exception:
-        from sklearn.ensemble import RandomForestClassifier
-
         model = RandomForestClassifier(
             n_estimators=250,
             min_samples_leaf=3,
@@ -223,8 +224,6 @@ def _fit_classifier(x_train: pd.DataFrame, y_train: pd.Series):
 
 
 def _evaluate(model, x_val: pd.DataFrame, y_val: pd.Series) -> dict:
-    from sklearn.metrics import average_precision_score, f1_score, precision_score, recall_score
-
     predictions = model.predict(x_val)
     probabilities = _positive_probabilities(model, x_val)
     return {
@@ -282,8 +281,6 @@ def _save_model(machine_id: str, run_id: str, model, metrics: dict) -> str:
 
 
 def _train_isolation_forest(machine_id: str, x_data: pd.DataFrame) -> str:
-    from sklearn.ensemble import IsolationForest
-
     model_dir = Path(get_settings().model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
     path = model_dir / f"{machine_id}-isolation-forest.joblib"
@@ -342,8 +339,6 @@ def _upsert_deployment(
 
 def _log_mlflow(machine_id: str, run_id: str, metrics: dict, model_path: str) -> None:
     try:
-        import mlflow
-
         mlflow.set_tracking_uri(get_settings().mlflow_tracking_uri)
         mlflow.set_experiment(f"iqPM-{machine_id}")
         with mlflow.start_run(run_name=run_id):
