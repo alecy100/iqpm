@@ -1,14 +1,46 @@
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
+import asyncio
+import logging
+from contextlib import asynccontextmanager, suppress
+from typing import Literal
 
-from app.database import get_db, init_db
-from app.schemas import AgentMessage, AgentResponse, SensorSnapshot, StreamStatus, TrainingResult
-from app.services import agent, analysis, prediction, training
+from fastapi import FastAPI, Query, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.agent.drift_monitor import drift_monitor
+from app.agent.runtime import InvalidThreadIdError, NoPendingApprovalError, ThreadBusyError, runtime
+from app.config import get_settings
+from app.database import init_db
+from app.schemas import AgentMessageIn, DashboardActionIn, ResumeIn
+from app.services import deployment, readings
+from app.services.features import FEATURE_COLUMNS, FEATURE_META
+from app.services.seed import seed_from_csv
+from app.services.serialization import to_jsonable
+from app.services.serving import model_server
 from app.services.streamer import streamer
 
 
-app = FastAPI(title="iqPM API", version="0.1.0")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    settings = get_settings()
+    init_db()
+    await asyncio.to_thread(seed_from_csv)
+    runtime.start()
+    monitor_task = asyncio.create_task(drift_monitor.run_forever()) if settings.drift_monitor_enabled else None
+    if settings.stream_autostart:
+        await streamer.start()
+    yield
+    await streamer.stop()
+    if monitor_task is not None:
+        monitor_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await monitor_task
+
+
+app = FastAPI(title="iqPM API", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -19,9 +51,17 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-def startup() -> None:
-    init_db()
+def _error(status: int):
+    async def handler(request: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=status, content={"detail": str(exc)})
+
+    return handler
+
+
+app.add_exception_handler(readings.UnknownMachineError, _error(404))
+app.add_exception_handler(InvalidThreadIdError, _error(400))
+app.add_exception_handler(ThreadBusyError, _error(409))
+app.add_exception_handler(NoPendingApprovalError, _error(409))
 
 
 @app.get("/health")
@@ -29,92 +69,109 @@ def health() -> dict:
     return {"status": "ok", "service": "iqPM"}
 
 
-@app.post("/stream/start", response_model=StreamStatus)
+# -- streaming --------------------------------------------------------------------------------
+
+
+@app.post("/stream/start")
 async def start_stream() -> dict:
     await streamer.start()
-    return streamer.status()
+    return to_jsonable(streamer.status())
 
 
-@app.post("/stream/stop", response_model=StreamStatus)
+@app.post("/stream/stop")
 async def stop_stream() -> dict:
     await streamer.stop()
-    return streamer.status()
+    return to_jsonable(streamer.status())
 
 
-@app.get("/stream/status", response_model=StreamStatus)
+@app.get("/stream/status")
 def stream_status() -> dict:
-    return streamer.status()
+    return to_jsonable(streamer.status())
+
+
+# -- machines ---------------------------------------------------------------------------------
 
 
 @app.get("/machines")
-def list_machines(db: Session = Depends(get_db)) -> list[str]:
-    return prediction.machines(db)
+def list_machines() -> list[str]:
+    return readings.list_machines()
 
 
-@app.get("/machines/{machine_id}/current", response_model=SensorSnapshot)
-def current_machine(machine_id: str, db: Session = Depends(get_db)) -> dict:
-    snapshot = prediction.latest_snapshot(db, machine_id)
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail="No readings available for this machine.")
-    return snapshot
+@app.get("/sensors")
+def sensors() -> list[dict]:
+    return [{"key": key, **FEATURE_META[key]} for key in FEATURE_COLUMNS]
 
 
-@app.get("/machines/{machine_id}/history")
-def machine_history(machine_id: str, limit: int = 120, db: Session = Depends(get_db)) -> list[dict]:
-    return prediction.history(db, machine_id, limit)
+@app.get("/machines/{machine_id}/current")
+def current_machine(machine_id: str) -> dict:
+    return to_jsonable(model_server.assess_latest(machine_id))
 
 
-@app.get("/fleet/risk")
-def fleet_risk(db: Session = Depends(get_db)) -> list[dict]:
-    return prediction.fleet_risk(db)
-
-
-@app.get("/analysis/profile")
-def profile(machine_id: str | None = None, db: Session = Depends(get_db)) -> dict:
-    return analysis.sensor_profile(db, machine_id)
-
-
-@app.get("/machines/{machine_id}/trend")
-def trend(machine_id: str, limit: int = 180, db: Session = Depends(get_db)) -> dict:
-    return analysis.trend_chart(db, machine_id, limit)
-
-
-@app.post("/machines/{machine_id}/predict", response_model=SensorSnapshot)
-def predict(machine_id: str, db: Session = Depends(get_db)) -> dict:
-    snapshot = prediction.latest_snapshot(db, machine_id)
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail="No readings available for this machine.")
-    return snapshot
-
-
-@app.post("/machines/{machine_id}/retrain", response_model=TrainingResult)
-def retrain(machine_id: str, db: Session = Depends(get_db)) -> dict:
-    return training.train_models_for_machine(db, machine_id)
-
-
-@app.get("/models/leaderboard")
-def leaderboard(machine_id: str | None = None, db: Session = Depends(get_db)) -> list[dict]:
-    return training.leaderboard(db, machine_id)
+@app.get("/machines/{machine_id}/readings")
+def machine_readings(machine_id: str, limit: int = Query(180, ge=1, le=2000)) -> dict:
+    frame = readings.recent_readings(machine_id, limit)
+    return {"machine_id": machine_id, "readings": to_jsonable(frame.to_dict("records"))}
 
 
 @app.get("/machines/{machine_id}/deployment")
-def deployment(machine_id: str, db: Session = Depends(get_db)) -> list[dict]:
-    return training.deployment_status(db, machine_id)
+def machine_deployment(machine_id: str) -> dict:
+    return to_jsonable(deployment.deployment_status(machine_id))
 
 
-@app.post("/machines/{machine_id}/deployment/promote")
-def promote(machine_id: str, db: Session = Depends(get_db)) -> dict:
-    return training.promote_staging_to_production(db, machine_id)
+@app.get("/machines/{machine_id}/approvals")
+def machine_approvals(machine_id: str) -> list[dict]:
+    readings.table_for(machine_id)
+    return runtime.open_approvals(machine_id)
 
 
-@app.get("/predictions/{prediction_id}/explain")
-def explain(prediction_id: int, db: Session = Depends(get_db)) -> dict:
-    explanation = prediction.explain_prediction(db, prediction_id)
-    if explanation is None:
-        raise HTTPException(status_code=404, detail="Prediction not found.")
-    return explanation
+@app.post("/machines/{machine_id}/actions/{action}")
+def machine_action(machine_id: str, action: Literal["retrain", "promote", "rollback"], payload: DashboardActionIn | None = None) -> dict:
+    """Dashboard buttons enter the same LangGraph path as chat requests."""
+    readings.table_for(machine_id)
+    payload = payload or DashboardActionIn()
+    thread_id = runtime.dashboard_action(machine_id, action, payload.thread_id, payload.target_version)
+    return runtime.snapshot(thread_id)
 
 
-@app.post("/agent/message", response_model=AgentResponse)
-def agent_message(payload: AgentMessage, db: Session = Depends(get_db)) -> dict:
-    return agent.handle_agent_message(db, payload.message, payload.machine_id)
+@app.get("/models/leaderboard")
+def leaderboard(machine_id: str | None = None, limit: int = Query(10, ge=1, le=100)) -> list[dict]:
+    return to_jsonable(deployment.leaderboard(machine_id, limit))
+
+
+@app.post("/drift/check")
+async def drift_check(machine_id: str | None = None, force: bool = False) -> list[dict]:
+    if machine_id:
+        result = [await asyncio.to_thread(drift_monitor.check_machine, machine_id, force)]
+    else:
+        result = await asyncio.to_thread(drift_monitor.check_all, force)
+    return to_jsonable(result)
+
+
+# -- agent ------------------------------------------------------------------------------------
+
+
+@app.get("/agent/graph")
+def agent_graph() -> dict:
+    return {
+        "chat": runtime.chat_graph.get_graph().draw_mermaid(),
+        "drift": runtime.drift_graph.get_graph().draw_mermaid(),
+    }
+
+
+@app.get("/agent/threads/{thread_id}")
+def get_thread(thread_id: str) -> dict:
+    return runtime.snapshot(thread_id)
+
+
+@app.post("/agent/threads/{thread_id}/messages")
+def post_message(thread_id: str, payload: AgentMessageIn) -> dict:
+    if payload.machine_id:
+        readings.table_for(payload.machine_id)
+    runtime.send_message(thread_id, payload.message, payload.machine_id)
+    return runtime.snapshot(thread_id)
+
+
+@app.post("/agent/threads/{thread_id}/resume")
+def resume_thread(thread_id: str, payload: ResumeIn) -> dict:
+    runtime.resume(thread_id, payload.approved)
+    return runtime.snapshot(thread_id)

@@ -19,7 +19,7 @@ services:
     image: python:3.11-slim
     working_dir: /mlflow
     command: >
-      sh -c "pip install --no-cache-dir mlflow==2.19.0 psycopg2-binary==2.9.10 &&
+      sh -c "pip install --no-cache-dir mlflow==2.22.5 psycopg2-binary==2.9.10 &&
       mlflow server --host 0.0.0.0 --port 5000
       --backend-store-uri sqlite:////mlflow/mlflow.db
       --default-artifact-root /mlflow/artifacts"
@@ -27,28 +27,33 @@ services:
       - "5000:5000"
     volumes:
       - mlflow_data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
 
   api:
     build:
       context: .
       dockerfile: Dockerfile.backend
+    env_file:
+      - .env
     environment:
       DATABASE_URL: postgresql+psycopg2://iqpm:iqpm@postgres:5432/iqpm
-      CSV_PATH: /data/synthetic_timeseries.csv
+      SEED_CSV_PATH: /data/synthetic_timeseries.csv
+      AI4I_CSV_PATH: /data/ai4i2020.csv
       MLFLOW_TRACKING_URI: http://mlflow:5000
-      STREAM_INTERVAL_SECONDS: 1
-      LABEL_REVEAL_LAG_HOURS: 6
-      MODEL_DIR: /models
     ports:
       - "8000:8000"
     volumes:
       - ./synthetic_timeseries.csv:/data/synthetic_timeseries.csv:ro
-      - model_data:/models
+      - ./ai4i2020.csv:/data/ai4i2020.csv:ro
     depends_on:
       postgres:
         condition: service_healthy
       mlflow:
-        condition: service_started
+        condition: service_healthy
 
   frontend:
     build:
@@ -64,4 +69,3 @@ services:
 volumes:
   postgres_data:
   mlflow_data:
-  model_data:
